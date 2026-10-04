@@ -10,16 +10,66 @@ from aiohttp import ClientError, ClientSession, ClientTimeout
 from aiohttp.client import _RequestContextManager
 
 from ._scraper import parse_circle_html, parse_login_token, parse_work_html
-from .circle import Circle
-from .exceptions import AuthenticationError, DlsiteError
-from .work import AgeCategory, BookType, Work, WorkOption, WorkType
+from .circle import Circle, MakerType
+from .exceptions import (
+    AuthenticationError,
+    DlsiteError,
+    InvalidIDError,
+    RestrictedWorkError,
+)
 
+from .work import AgeCategory, BookType, Work, WorkOption, WorkType
 
 _T = TypeVar("_T")
 
 
 def _datetime_from_timestamp(timestamp: str) -> datetime:
     return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+
+
+def _json_names(values: Any, key: str = "name") -> list[str] | None:
+    """Read names in source order."""
+    names = []
+    for item in values or []:
+        name = item.get(key) or ""
+        if name:
+            names.append(name)
+    return names or None
+
+
+def _parse_work_json(data: dict[str, Any], work: Work) -> dict[str, Any]:
+    """Map optional product.json metadata to existing HTML-derived Work fields."""
+    page_count = int(data.get("pages") or 0) or None
+    creators = data.get("creaters") or {}
+    details: dict[str, Any] = {
+        "description": data.get("intro_s") or None,
+        "genre": _json_names(data.get("genres_replaced")),
+        "sample_images": [image["url"] for image in data.get("image_samples") or []]
+        or None,
+        "author": _json_names(data.get("author"), "author_name"),
+        "page_count": page_count,
+        "scenario": _json_names(creators.get("scenario_by")),
+        "illustration": _json_names(creators.get("illust_by")),
+        "voice_actor": _json_names(creators.get("voice_by")),
+    }
+    try:
+        maker_type = MakerType.from_maker_id(work.maker_id)
+    except InvalidIDError:
+        pass
+    else:
+        details[maker_type.value] = data.get("maker_name") or None
+    music = []
+    for creator in creators.get("music_by") or []:
+        name = creator.get("name") or ""
+        if name:
+            role = creator.get("sub_classification") or ""
+            music.append(f"{name}({role})" if role else name)
+    details["music"] = music or None
+    return {
+        key: value
+        for key, value in details.items()
+        if value is not None and getattr(work, key) is None
+    }
 
 
 class BaseAPI(AbstractAsyncContextManager["_T"]):
@@ -180,11 +230,29 @@ class DlsiteAPI(BaseAPI["DlsiteAPI"]):
         return Work.from_dict(info)
 
     async def _fill_work_details(self, work: Work) -> Work:
-        html = await self._fetch_work_html(work)
-        if not html:
-            return work
-        details = parse_work_html(html)
+        try:
+            html = await self._fetch_work_html(work)
+            if not html:
+                return work
+            details = parse_work_html(html)
+        except RestrictedWorkError:
+            details = await self._fetch_work_json_details(work)
         return replace(work, **details)
+
+    async def _fetch_work_json_details(self, work: Work) -> dict[str, Any]:
+        url = "https://www.dlsite.com/maniax/api/=/product.json"
+        try:
+            async with self.get(
+                url, params={"workno": work.product_id}, raise_for_status=False
+            ) as response:
+                if response.status != 200:
+                    return {}
+                data = await response.json()
+        except (ClientError, TimeoutError, ValueError):
+            return {}
+        if isinstance(data, list) and data and data[0].get("workno") == work.product_id:
+            return _parse_work_json(data[0], work)
+        return {}
 
     async def _fetch_work_html(self, work: Work) -> str | None:
         urls = [
@@ -194,13 +262,24 @@ class DlsiteAPI(BaseAPI["DlsiteAPI"]):
             )
             for typ in ("work", "announce")
         ]
-        html: str | None = None
+        restriction: RestrictedWorkError | None = None
         for url in urls:
             async with self.get(url, raise_for_status=False) as response:
                 if response.status == 200:
-                    html = await response.text()
-                    break
-        return html
+                    return await response.text()
+                try:
+                    content = await response.text()
+                except (ClientError, TimeoutError, UnicodeError):
+                    continue
+                if "error_box_work" not in content:
+                    continue
+                try:
+                    parse_work_html(content)
+                except RestrictedWorkError as e:
+                    restriction = e
+        if restriction:
+            raise restriction
+        return None
 
     async def get_circle(self, maker_id: str) -> Circle:
         """Return the specified circle.

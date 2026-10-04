@@ -12,8 +12,7 @@ from collections.abc import Iterable
 import lxml.html.soupparser as soupparser
 from lxml import html
 
-from .exceptions import ScrapingError
-
+from .exceptions import RestrictedWorkError, ScrapingError
 
 logger = logging.getLogger()
 
@@ -151,9 +150,22 @@ _parsers = [
 ]
 
 
+_RESTRICTED_WORK_MESSAGES = (
+    "This work is an exclusive for DLsite users.",
+    "この作品はDLsiteユーザー限定コンテンツです。",
+    "この作品は現在販売されていません",
+)
+
+
 def parse_work_html(content: str) -> dict[str, Any]:
     """Parse work HTML."""
     tree = soupparser.fromstring(_clean_xml(content))
+    for box in tree.find_class("error_box_work"):
+        text = _unescape(box.text_content())
+        if any(message in text for message in _RESTRICTED_WORK_MESSAGES):
+            raise RestrictedWorkError(
+                "DLsite product page is restricted or unavailable."
+            )
     info: dict[str, Any] = {}
     for table in (
         '//table[@id="work_maker"]//tr',
